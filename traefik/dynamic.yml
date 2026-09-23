@@ -1,0 +1,29 @@
+# Dynamic Traefik configuration (file provider).
+#
+# Single edge router for ALL sandbox subdomains: every request to
+# <subdomain>.sandbox.localhost lands here and is forwarded to the backend's
+# gateway on the host. The gateway owns wake-on-request (it starts a hibernated
+# container and reverses the request into it), so it must be in front of the
+# per-sandbox containers — hence the wildcard at the edge and just this one
+# backend.
+#
+# Per-sandbox containers still carry docker-provider Traefik labels, but at
+# priority 1 so they lose to this wildcard (default priority) in normal
+# operation. That fallback metadata exists so the platform works even if the
+# wake path is ever bypassed.
+#
+# Requires docker-compose.dev.yml to set extra_hosts host.docker.internal.
+
+http:
+  routers:
+    sandbox-edge:
+      rule: "HostRegexp(`^[a-z0-9-]+\\.sandbox\\.localhost$`)"
+      entrypoints:
+        - web
+      service: sandbox-gateway
+
+  services:
+    sandbox-gateway:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8090"

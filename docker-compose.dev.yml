@@ -1,0 +1,77 @@
+# Local development infrastructure for API Sandbox Links.
+#
+# This compose file runs ONLY the static platform services:
+#   - Postgres  (platform metadata — users, sandboxes, deployments, ...)
+#   - Redis     (hot state — last_request_at, live stats buffer)
+#   - Traefik   (dynamic reverse proxy with Docker-label auto-discovery)
+#
+# Sandbox app containers and per-sandbox sidecar databases are NOT defined here;
+# the backend orchestrator creates those dynamically at runtime.
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml down
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sandbox-platform-db
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: sandbox_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d sandbox_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: sandbox-platform-redis
+    # Host 6379 is commonly already taken by a system redis; map to 6380.
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  traefik:
+    image: traefik:v3.1
+    container_name: sandbox-platform-traefik
+    command:
+      # Docker provider is DISABLED: the daemon rejects Traefik's pinned API
+      # version (Daemon 29 requires API >= 1.44) and the docker labels are only
+      # a fallback anyway. All sandbox routing flows through the file provider.
+      - --providers.docker=false
+      # File provider delivers the wildcard edge router (all *.sandbox.localhost
+      # goes to the backend's gateway for wake-on-request; see traefik/dynamic.yml).
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+      # Entrypoints: 80 for sandbox traffic, 8081 for the Traefik dashboard/API.
+      # --api.insecure=true by default binds the API on the traefik entrypoint, so
+      # declare it explicitly here else it stays on :8080 (unpublished) in the container.
+      - --entrypoints.web.address=:80
+      - --entrypoints.traefik.address=:8081
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --accesslog=true
+    ports:
+      - "80:80"
+      - "8081:8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    extra_hosts:
+      # Lets Traefik (in its own container) reach the backend gateway running
+      # on the host at 127.0.0.1:8090.
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  postgres_data:

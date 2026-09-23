@@ -1,0 +1,80 @@
+// Package orchestrator owns everything that touches Docker directly: building
+// images with nixpacks, running/stopping sandbox containers, provisioning
+// sidecar databases, streaming logs and stats, and tearing things down. The
+// rest of the backend talks to this package, never to the Docker SDK.
+package orchestrator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+
+	"github.com/api-sandbox-links/backend/internal/cache"
+	"github.com/api-sandbox-links/backend/internal/config"
+	"github.com/api-sandbox-links/backend/internal/db"
+	"github.com/api-sandbox-links/backend/internal/secret"
+	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
+	"github.com/google/uuid"
+)
+
+// Orchestrator is the single entry point for Docker lifecycle operations.
+// It owns a Docker client plus the platform services it needs to wire a
+// sandbox's container into storage, cache, and label-based routing.
+type Orchestrator struct {
+	docker     *client.Client
+	cfg        *config.Config
+	store      *db.Store
+	cache      *cache.Redis
+	secret     *secret.Box
+	logger     *slog.Logger
+	statsMu    sync.Mutex // guards collectors
+	collectors map[string]*StatsCollector
+}
+
+// New connects a Docker client and returns a ready Orchestrator. It fails
+// fast if the daemon is unreachable so misconfiguration is obvious.
+func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.Redis, box *secret.Box, logger *slog.Logger) (*Orchestrator, error) {
+	cli, err := client.NewClientWithOpts(
+		client.FromEnv,
+		client.WithHost(cfg.DockerHost),
+		client.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: creating docker client: %w", err)
+	}
+	if _, err := cli.Ping(ctx); err != nil {
+		return nil, fmt.Errorf("orchestrator: cannot reach docker daemon (%s): %w", cfg.DockerHost, err)
+	}
+	return &Orchestrator{
+		docker:     cli,
+		cfg:        cfg,
+		store:      store,
+		cache:      cache,
+		secret:     box,
+		logger:     logger,
+		collectors: map[string]*StatsCollector{},
+	}, nil
+}
+
+// Close releases the orchestrator's Docker client connection.
+func (o *Orchestrator) Close() error {
+	return o.docker.Close()
+}
+
+// Logger exposes the slog logger for use by helpers in this package.
+func (o *Orchestrator) Logger() *slog.Logger { return o.logger }
+
+// volumeCreate builds the options for a named, labelled Docker volume.
+func volumeCreate(name string) volume.CreateOptions {
+	return volume.CreateOptions{
+		Name:   name,
+		Labels: map[string]string{"api-sandbox-links.purpose": "sandbox-data"},
+	}
+}
+
+// newID returns a UUID string for rows the DB model expects populated client-side.
+func newID() string {
+	return uuid.NewString()
+}
