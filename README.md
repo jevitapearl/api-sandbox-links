@@ -11,14 +11,18 @@ Turn any public GitHub repository into a **disposable, time-limited, fully-remot
 
 ## Quick start
 
+There's no Makefile — these are the exact commands (see `docs/SETUP.md`):
+
 ```bash
-# 1. One-time bootstrap (Go build, nixpacks, images)
-make bootstrap          # or follow docs/SETUP.md step by step
+# 1. Environment + infrastructure
+cp .env.example .env                     # fill in DATABASE_URL/REDIS/SECRETS (see SETUP.md)
+docker compose -f docker-compose.dev.yml up -d     # postgres :5432, redis :6380, traefik :80/:8081
 
-# 2. Bring up infrastructure + start the backend
-make up                # docker compose (postgres, redis, traefik) + backend on :8080/:8090
+# 2. Backend — build from backend/ (that's where go.mod lives), run from the repo root
+cd backend && go build -o server ./cmd/server && cd ..
+./backend/server &                       # :8080 API + :8090 gateway
 
-# 3. Run the frontend
+# 3. Frontend
 cd frontend && npm i && npm run dev      # http://localhost:3000
 ```
 
@@ -46,11 +50,15 @@ docker-compose.dev.yml   local infra (postgres, redis, traefik) + volume
 
 ## Documentation
 
-- `docs/ARCHITECTURE.md` — system design, routing, wake-on-request, reapers, data flow (Mermaid diagrams)
+- `docs/README.md` — documentation index
+- `docs/SETUP.md` — environment, prerequisites, build order, OAuth, troubleshooting
+- `docs/ARCHITECTURE.md` — system design, routing, wake-on-request, port discovery, reapers
 - `docs/API.md` — every endpoint, request/response shapes, WebSocket protocols
 - `docs/DATABASE.md` — schema, migrations, GORM table-name caveats
-- `docs/SETUP.md` — environment, prerequisites, build order, getting things running
+
+All docs are cross-referenced to the code that defines them (config keys, schema,
+routes), so they can be verified quickly when behaviour changes.
 
 ## Status
 
-Phase A–G implemented and verified end-to-end in dev: create → clone → nixpacks build → container running → public URL returns `Hello World!` → hibernate/wake 0.8s → file edit → save-redeploy → commit/push endpoints wired (push requires a real GitHub token from OAuth single sign-on).# api-sandbox-links
+Phase A–G implemented and verified end-to-end in dev: create → clone → nixpacks build → container running → public URL responds → hibernate/wake → file edit → save-redeploy → commit/push wired (push requires a real GitHub token from OAuth sign-in).

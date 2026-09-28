@@ -2,7 +2,7 @@
 //
 // Redis deliberately holds only two kinds of data (see BUILD_PROMPT section 2):
 //  1. last-request markers used by the idle-timeout reaper,
-//  2. a short buffer of latest resource stats, flushed to Postgres in batches.
+//  2. the latest resource sample per sandbox, flushed to Postgres on a timer.
 //
 // Everything durable lives in Postgres; nothing in Redis is an authoritative
 // record of anything.
@@ -72,71 +72,65 @@ func (r *Redis) Clear(ctx context.Context, sandboxID string) error {
 	return r.client.Del(ctx, lastRequestKey(sandboxID)).Err()
 }
 
-// ---- live stats buffer (resource dashboard) -----------------------------
+// ---- latest live resource sample (resource dashboard) -------------------
+//
+// The stats collector overwrites one key per sandbox on every sample, and the
+// flush worker reads it on its own slower cadence to build the history chart.
+// A single key rather than a growing list, because the 1s feed exists to drive
+// a live readout and only its newest value is ever worth persisting.
 
-func statsKey(sandboxID string) string {
-	return "stats:" + sandboxID
+func latestStatKey(sandboxID string) string {
+	return "stats:latest:" + sandboxID
 }
 
-// PushStat appends one encoded stats frame to the sandbox's buffer list and
-// trims it to the newest maxLen entries.
-func (r *Redis) PushStat(ctx context.Context, sandboxID string, frame []byte, maxLen int64) error {
-	key := statsKey(sandboxID)
-	pipe := r.client.TxPipeline()
-	pipe.RPush(ctx, key, frame)
-	pipe.LTrim(ctx, key, -maxLen, -1)
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return fmt.Errorf("cache: buffering stat: %w", err)
+// latestStatTTL is deliberately short. If a container's stats stream dies, the
+// key must expire rather than serve a frozen reading as though it were live.
+const latestStatTTL = 10 * time.Second
+
+// SetLatestStat overwrites the sandbox's most recent sample. The TTL is
+// refreshed on every write, so the key's lifetime tracks the collector's.
+func (r *Redis) SetLatestStat(ctx context.Context, sandboxID string, sample []byte) error {
+	if err := r.client.Set(ctx, latestStatKey(sandboxID), sample, latestStatTTL).Err(); err != nil {
+		return fmt.Errorf("cache: writing latest stat: %w", err)
 	}
 	return nil
 }
 
-// PopStatBatch atomically pops up to limit buffered frames and returns them in
-// insertion order. Used by the flush worker to batch Redis frames into
-// Postgres.
-func (r *Redis) PopStatBatch(ctx context.Context, sandboxID string, limit int64) ([][]byte, error) {
-	vals, err := r.client.LPopCount(ctx, statsKey(sandboxID), int(limit)).Result()
+// LatestStat returns the sandbox's most recent sample, or nil when the key is
+// absent or has expired.
+func (r *Redis) LatestStat(ctx context.Context, sandboxID string) ([]byte, error) {
+	raw, err := r.client.Get(ctx, latestStatKey(sandboxID)).Bytes()
 	if err == redis.Nil {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cache: popping stat batch: %w", err)
+		return nil, fmt.Errorf("cache: reading latest stat: %w", err)
 	}
-	out := make([][]byte, 0, len(vals))
-	for _, v := range vals {
-		out = append(out, []byte(v))
-	}
-	return out, nil
+	return raw, nil
 }
 
-// StatsBufferLen reports how many frames are buffered (used in tests).
-func (r *Redis) StatsBufferLen(ctx context.Context, sandboxID string) (int64, error) {
-	return r.client.LLen(ctx, statsKey(sandboxID)).Result()
-}
-
-// StatFrame is the JSON shape buffered in Redis between the stats collector
+// StatFrame is the JSON shape published in Redis between the stats collector
 // and the Postgres flush worker.
 type StatFrame struct {
 	SandboxID        string    `json:"sandbox_id"`
 	CPUPercent       float32   `json:"cpu_percent"`
 	MemoryUsedBytes  int64     `json:"memory_used_bytes"`
 	MemoryLimitBytes int64     `json:"memory_limit_bytes"`
-	NetworkRXBytes   int64     `json:"network_rx_bytes"`
-	NetworkTXBytes   int64     `json:"network_tx_bytes"`
+	NetworkRxBytes   int64     `json:"network_rx_bytes"`
+	NetworkTxBytes   int64     `json:"network_tx_bytes"`
 	RecordedAt       time.Time `json:"recorded_at"`
 }
 
-// EncodeStatFrame renders a frame for buffering.
+// EncodeStatFrame renders a sample for publishing.
 func EncodeStatFrame(f StatFrame) ([]byte, error) {
 	return json.Marshal(f)
 }
 
-// DecodeStatFrame parses a buffered frame.
+// DecodeStatFrame parses a published sample.
 func DecodeStatFrame(raw []byte) (*StatFrame, error) {
 	var f StatFrame
 	if err := json.Unmarshal(raw, &f); err != nil {
-		return nil, fmt.Errorf("cache: decoding buffered stat frame: %w", err)
+		return nil, fmt.Errorf("cache: decoding published stat sample: %w", err)
 	}
 	return &f, nil
 }

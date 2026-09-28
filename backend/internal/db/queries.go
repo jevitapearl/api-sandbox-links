@@ -1,11 +1,13 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Store bundles the gorm handle plus every query. Keeping all SQL-shaped
@@ -102,12 +104,73 @@ func (s *Store) GetRepository(id string) (*Repository, error) {
 // ---- sandboxes ----------------------------------------------------------
 
 // CreateSandbox persists a new sandbox row sized from the deploy request.
+//
+// ExpiresAt is anchored at CreatedAt here as a provisional deadline: it is what
+// cleans up a sandbox whose build never finishes. The real clock starts when the
+// sandbox first goes live, via MarkSandboxActive.
 func (s *Store) CreateSandbox(sb *Sandbox) error {
 	if sb.ID == "" {
 		sb.ID = newID()
 	}
 	sb.ExpiresAt = sb.CreatedAt.Add(time.Duration(sb.LifetimeSeconds) * time.Second)
 	return s.db.Create(sb).Error
+}
+
+// ErrSandboxDestroyed is returned by MarkSandboxActive when the row is already a
+// tombstone. A deploy that finishes after the user destroyed (or the reaper
+// expired) the sandbox must not resurrect it.
+var ErrSandboxDestroyed = errors.New("db: sandbox is already destroyed")
+
+// MarkSandboxActive records a transition into 'running' and, on the first one
+// only, starts the lifetime clock.
+//
+// The distinction matters: a redeploy also walks building -> running, so keying
+// off status would hand out a fresh full lifetime on every save-and-redeploy and
+// make the sandbox immortal. The `activated_at IS NULL` predicate makes the
+// rebasing a single atomic claim on the row, so two concurrent deploys cannot
+// both win it.
+//
+// It returns true when this call performed the first activation, and
+// ErrSandboxDestroyed if the row is already torn down. `fields` carries the
+// running-state columns (container_id, image_tag, ...); expires_at and
+// activated_at are owned by this method and are ignored in `fields`.
+func (s *Store) MarkSandboxActive(id string, at time.Time, fields map[string]any) (bool, error) {
+	// First activation: claim the clock and rebase the deadline in one statement.
+	// lifetime_seconds is read from the row rather than passed in, so the new
+	// deadline is derived from the same value the reaper and warnings use.
+	first := map[string]any{
+		"activated_at": at,
+		"expires_at":   gorm.Expr("?::timestamptz + (lifetime_seconds * interval '1 second')", at),
+	}
+	for k, v := range fields {
+		first[k] = v
+	}
+	res := s.db.Model(&Sandbox{}).
+		Where("id = ? AND activated_at IS NULL AND destroyed_at IS NULL", id).
+		Updates(first)
+	if res.Error != nil {
+		return false, fmt.Errorf("db: activating sandbox %s: %w", id, res.Error)
+	}
+	if res.RowsAffected > 0 {
+		return true, nil
+	}
+
+	// The claim was lost, which is one of two legitimate reasons.
+	var sb Sandbox
+	if err := s.db.First(&sb, "id = ?", id).Error; err != nil {
+		return false, fmt.Errorf("db: reading sandbox %s after failed activation: %w", id, err)
+	}
+	if sb.DestroyedAt != nil {
+		return false, ErrSandboxDestroyed
+	}
+	// Already activated: a redeploy. Apply the running state but leave the
+	// deadline exactly where it was.
+	if err := s.db.Model(&Sandbox{}).
+		Where("id = ? AND destroyed_at IS NULL", id).
+		Updates(fields).Error; err != nil {
+		return false, fmt.Errorf("db: updating active sandbox %s: %w", id, err)
+	}
+	return false, nil
 }
 
 // GetSandbox fetches a sandbox by ID.
@@ -308,24 +371,72 @@ func (s *Store) GetSandboxDatabase(id string) (*SandboxDatabase, error) {
 // ---- resource snapshots -------------------------------------------------
 
 // InsertResourceSnapshots bulk-inserts buffered resource samples.
+//
+// A conflict on (sandbox_id, recorded_at) is expected rather than exceptional:
+// the flush worker reads one Redis key per sandbox, so a collector that restarts
+// between two passes can leave the key holding a sample the previous pass
+// already stored. ON CONFLICT DO NOTHING makes that a no-op instead of aborting
+// the whole batch, which would otherwise throw away every other sandbox's
+// reading along with it.
 func (s *Store) InsertResourceSnapshots(rows []*ResourceSnapshot) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	if err := s.db.CreateInBatches(rows, 200).Error; err != nil {
+	if err := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "sandbox_id"}, {Name: "recorded_at"}},
+		DoNothing: true,
+	}).CreateInBatches(rows, 200).Error; err != nil {
 		return fmt.Errorf("db: inserting resource snapshots: %w", err)
 	}
 	return nil
 }
 
+// DeleteResourceSnapshotsForSandbox drops every sample belonging to a sandbox.
+// Teardown calls it so a destroyed sandbox does not leave behind rows that
+// nothing will ever read; the cascade on sandbox_id cannot do this job, because
+// the sandbox row survives as a tombstone.
+func (s *Store) DeleteResourceSnapshotsForSandbox(sandboxID string) (int64, error) {
+	res := s.db.Where("sandbox_id = ?", sandboxID).Delete(&ResourceSnapshot{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("db: deleting resource snapshots for %s: %w", sandboxID, res.Error)
+	}
+	return res.RowsAffected, nil
+}
+
 // QueryResourceSnapshots returns samples within a window, oldest first.
+//
+// limit caps how many rows come back, and it is the newest ones that matter: a
+// 24h window holds ~8,600 rows at the flush cadence, so `ORDER BY recorded_at
+// ASC LIMIT n` would return the *oldest* n and the chart would show a stale
+// two-hour slice from the start of the window. Selecting the newest n in an
+// inner query and re-sorting ascending in the outer one keeps the cap while
+// still handing back points in the order they were recorded.
 func (s *Store) QueryResourceSnapshots(sandboxID string, since, until time.Time, limit int) ([]*ResourceSnapshot, error) {
 	var out []*ResourceSnapshot
-	q := s.db.Where("sandbox_id = ? AND recorded_at BETWEEN ? AND ?", sandboxID, since, until)
-	if err := q.Order("recorded_at ASC").Limit(limit).Find(&out).Error; err != nil {
+	const q = `SELECT * FROM (
+		SELECT * FROM resource_snapshots
+		WHERE sandbox_id = ? AND recorded_at BETWEEN ? AND ?
+		ORDER BY recorded_at DESC
+		LIMIT ?
+	) AS recent
+	ORDER BY recent.recorded_at ASC`
+	if err := s.db.Raw(q, sandboxID, since, until, limit).Scan(&out).Error; err != nil {
 		return nil, fmt.Errorf("db: querying resource snapshots: %w", err)
 	}
 	return out, nil
+}
+
+// DeleteResourceSnapshotsBefore drops samples older than the cutoff and returns
+// how many went. resource_snapshots is append-only and would otherwise grow
+// forever; the snapshot reaper calls this on a timer. The recorded_at index
+// makes the range delete cheap.
+func (s *Store) DeleteResourceSnapshotsBefore(cutoff time.Time) (int64, error) {
+	res := s.db.Where("recorded_at < ?", cutoff).Delete(&ResourceSnapshot{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("db: deleting resource snapshots older than %s: %w",
+			cutoff.UTC().Format(time.RFC3339), res.Error)
+	}
+	return res.RowsAffected, nil
 }
 
 // ---- file edits ---------------------------------------------------------

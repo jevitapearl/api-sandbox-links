@@ -1,0 +1,87 @@
+%% Live sandbox telemetry: browser <-> API <-> Docker / Redis / Postgres
+%% Renders in GitHub, mermaid.live, and any Mermaid-aware docs pipeline.
+%% Companion prose lives in ../ARCHITECTURE.md ("Live log & metrics pipeline").
+
+sequenceDiagram
+    autonumber
+
+    participant B as Browser<br/>(log panel / stats panel)
+    participant A as API<br/>(api/websocket.go)
+    participant O as Orchestrator<br/>(collector / stream)
+    participant D as Docker
+    participant R as Redis
+    participant P as Postgres
+
+    rect rgb(232, 240, 254)
+        Note over B,A: Handshake — authorization happens before the upgrade
+        B->>A: GET /api/sandboxes/{id}/stats/ws (+ session cookie, Upgrade)
+        A->>A: requireUser then authorizeSandboxAccess<br/>(owner check, sandbox exists)
+        alt not authorized
+            A-->>B: close 1008 (policy violation)
+            Note over B: Terminal close, no retry.<br/>"You may not watch this sandbox."
+        else authorized
+            A-->>B: 101 Switching Protocols
+        end
+    end
+
+    rect rgb(240, 253, 244)
+        Note over A,O: Bring up the metrics source (idempotent, per sandbox)
+        A->>O: EnsureStatsCollector(id)
+        O->>D: ContainerStats stream (follow)
+        alt no live container
+            A-->>B: unavailable — "sandbox is hibernated"
+            Note over B: Terminal close, no retry.
+        end
+    end
+
+    rect rgb(254, 249, 231)
+        Note over O,R: ~1s cadence — the live feed, never touching Postgres
+        D-->>O: cpu / mem / net counters
+        Note over O: CPU% from delta PreCPUStats, not the raw total.<br/>Memory is usage minus inactive_file.<br/>Network is per-interface deltas, summed.
+        par fan-out to subscribers
+            O-->>A: ResourceSample
+            A-->>B: stats frame (cpu_percent, memory_used_bytes, …)
+        and publish newest-only
+            O->>R: SET stats:latest:{id} = sample, TTL 10s
+        end
+    end
+
+    rect rgb(255, 245, 245)
+        Note over A,B: Liveness — each socket re-reads the sandbox row every 5s
+        loop every 5s while open
+            A->>A: sandbox.status
+        end
+        alt status left "running"
+            A-->>B: closed — "sandbox stopped"
+            A->>O: close subscription (ctx cancelled)
+            O->>D: stream closed, container untouched
+        end
+    end
+
+    rect rgb(245, 243, 255)
+        Note over R,P: Separate, slower cadence — persistence off the hot path
+        loop every 10s (StatsFlushWorker)
+            A->>R: GET stats:latest:{id}
+            alt key present
+                R-->>A: newest sample
+                A->>P: INSERT resource_snapshots
+            else key expired (TTL 10s)
+                Note over A: The container's stats stream died.<br/>No row: a frozen reading<br/>is never stored as live.
+            end
+        end
+    end
+
+    rect rgb(250, 250, 250)
+        Note over B,P: Reading history, and keeping the table bounded
+        B->>A: GET /api/sandboxes/{id}/stats/history?range=1h|6h|24h|7d
+        A->>A: validate range against allowlist
+        alt range not allowed
+            A-->>B: 400 invalid range
+        else allowed
+            A->>P: SELECT snapshots WHERE recorded_at >= since
+            P-->>A: rows (capped per range)
+            A-->>B: range, since, until, snapshots
+        end
+    end
+
+    Note over A,P: hourly SnapshotReaper deletes rows older than 7 days

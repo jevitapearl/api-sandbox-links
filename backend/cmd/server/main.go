@@ -85,12 +85,15 @@ func run() error {
 	}
 
 	// --- Background workers ----------------------------------------------
-	// Three reapers, kept strictly separate (idle = reversible, expiry =
-	// irreversible, warnings = notifications) plus the stats flush worker.
+	// Three reapers over sandbox rows, kept strictly separate (idle =
+	// reversible, expiry = irreversible, warnings = notifications), plus the
+	// two that keep resource_snapshots bounded in both directions: one writes
+	// them on a slow cadence, one trims them to the retention window.
 	go reaper.NewWarningsWorker(store, logger, 60*time.Second).Run(ctx)
 	go reaper.NewIdleReaper(store, redis, orch, logger, 30*time.Second).Run(ctx)
 	go reaper.NewExpiryReaper(store, orch, cfg, logger, 60*time.Second).Run(ctx)
-	go orchestrator.NewStatsFlushWorker(store, redis, logger, 15*time.Second).Run(ctx)
+	go reaper.NewSnapshotReaper(store, logger, reaper.SnapshotSweepInterval, reaper.SnapshotRetention).Run(ctx)
+	go orchestrator.NewStatsFlushWorker(store, redis, logger, orchestrator.StatsFlushInterval).Run(ctx)
 
 	// --- HTTP surfaces ---------------------------------------------------
 	server := api.New(cfg, store, redis, orch, deployer, box, aiClient, logger)

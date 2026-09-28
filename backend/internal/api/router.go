@@ -70,8 +70,8 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":  "ok",
-			"time":    time.Now().UTC().Format(time.RFC3339),
+			"status":   "ok",
+			"time":     time.Now().UTC().Format(time.RFC3339),
 			"dev_auth": s.cfg.DevAuth,
 		})
 	})
@@ -80,10 +80,16 @@ func (s *Server) Router() http.Handler {
 	r.Get("/api/auth/github", s.handleAuthStart)
 	r.Get("/api/auth/github/callback", s.handleAuthCallback)
 
+	// Logout is deliberately not behind requireUser. Its whole job is to clear
+	// the session cookie, so requiring a valid session to reach it means a
+	// caller whose session has already gone bad cannot clear the very cookie
+	// that is causing it. Clearing a cookie only ever affects the caller's own
+	// browser, so there is nothing to authorize here.
+	r.Post("/api/auth/logout", s.handleLogout)
+
 	r.Group(func(protected chi.Router) {
 		protected.Use(s.requireUser)
 		protected.Get("/api/me", s.handleMe)
-		protected.Post("/api/auth/logout", s.handleLogout)
 
 		protected.Route("/api/sandboxes", func(pr chi.Router) {
 			pr.Get("/", s.handleListSandboxes)
@@ -104,9 +110,10 @@ func (s *Server) Router() http.Handler {
 			pr.Post("/{id}/commit", s.handleCommitPush)
 		})
 
-		// Live channels.
-		protected.Get("/api/sandboxes/{id}/logs", s.handleLogsWS)
-		protected.Get("/api/sandboxes/{id}/stats", s.handleStatsWS)
+		// Live channels. Both share authorizeSandboxAccess and the same
+		// unavailable/closed lifecycle; see websocket.go.
+		protected.Get("/api/sandboxes/{id}/logs/ws", s.handleLogsWS)
+		protected.Get("/api/sandboxes/{id}/stats/ws", s.handleStatsWS)
 	})
 
 	return r

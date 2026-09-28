@@ -58,5 +58,16 @@ func (o *Orchestrator) TeardownSandbox(ctx context.Context, sandbox *db.Sandbox)
 		o.logger.Warn("teardown: removing network",
 			slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
 	}
+
+	// Metric history for a destroyed sandbox is unreadable and, because the
+	// sandbox row survives as a tombstone, never cascades away on its own — the
+	// foreign key only fires if the row itself is deleted, which this platform
+	// never does. Without this, every destroyed sandbox leaves up to 7 days of
+	// rows behind for the retention reaper to find. Best-effort: a failure here
+	// must not block a teardown that has already removed the containers.
+	if _, err := o.store.DeleteResourceSnapshotsForSandbox(sandbox.ID); err != nil {
+		o.logger.Warn("teardown: deleting resource snapshots",
+			slog.String("sandbox", sandbox.ID), slog.String("err", err.Error()))
+	}
 	return nil
 }

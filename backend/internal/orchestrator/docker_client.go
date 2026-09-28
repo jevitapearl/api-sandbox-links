@@ -22,7 +22,12 @@ import (
 // Orchestrator is the single entry point for Docker lifecycle operations.
 // It owns a Docker client plus the platform services it needs to wire a
 // sandbox's container into storage, cache, and label-based routing.
+//
+// ctx is the process-lifetime context from main. Background streams started here
+// (the per-sandbox stats collectors) derive from it, so shutting the server
+// down tears them down instead of leaking a Docker connection each.
 type Orchestrator struct {
+	ctx        context.Context
 	docker     *client.Client
 	cfg        *config.Config
 	store      *db.Store
@@ -48,6 +53,7 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 		return nil, fmt.Errorf("orchestrator: cannot reach docker daemon (%s): %w", cfg.DockerHost, err)
 	}
 	return &Orchestrator{
+		ctx:        ctx,
 		docker:     cli,
 		cfg:        cfg,
 		store:      store,

@@ -136,16 +136,33 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"github_id": user.GithubID,
-		"username":  user.Username,
+		"github_id":  user.GithubID,
+		"username":   user.Username,
 		"avatar_url": user.AvatarURL,
-		"dev":       s.cfg.DevAuth,
+		"dev":        s.cfg.DevAuth,
 	})
 }
 
 // handleLogout clears the session cookie.
+//
+// It is intentionally unauthenticated and idempotent: a caller with a missing,
+// corrupt or expired session must still be able to clear the cookie, otherwise
+// the only way out is to wait out the cookie's MaxAge. It answers 200 whether or
+// not a session was actually present, so the client's logout flow never has to
+// distinguish the two cases.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{Name: oauthStateCookie, Path: "/", MaxAge: -1})
+	// Mirror the attributes used when the session was set. Browsers identify a
+	// cookie by name+domain+path, but keeping HttpOnly/SameSite in step avoids a
+	// silent no-op if the set-cookie above ever gains Secure or a narrower Path.
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

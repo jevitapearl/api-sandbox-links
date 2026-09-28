@@ -34,6 +34,12 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Child lifetime = parent's remaining lifetime, clamped to [min, max].
+	//
+	// The parent is already live, so its remaining time is the meaningful
+	// figure. The child is not: like any new sandbox it is created 'queued' and
+	// its own clock starts when it first goes live, so the child ends up outliving
+	// the parent by however long the copy takes. That is the intended reading of
+	// a fork — a fresh link, not an extension of the old one.
 	remaining := time.Until(parent.ExpiresAt)
 	childLifetime := int64(remaining / time.Second)
 	if childLifetime < MinLifetimeSeconds {

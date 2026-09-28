@@ -266,11 +266,16 @@ func (o *Orchestrator) DiscoverPort(ctx context.Context, ip string, planned int,
 	}
 }
 
+// SandboxIDLabel is the Docker label every container belonging to a sandbox
+// carries. It is the only thing tying a running container back to its row, so it
+// is declared once here rather than spelled out at each use.
+const SandboxIDLabel = "api-sandbox-links.sandbox-id"
+
 // FindContainersBySandbox lists every container tagged with the given sandbox
 // ID (the app container plus any sidecar DB). Used for full cleanup.
 func (o *Orchestrator) FindContainersBySandbox(ctx context.Context, sandboxID string) ([]container.Summary, error) {
 	f := filters.NewArgs()
-	f.Add("label", "api-sandbox-links.sandbox-id="+sandboxID)
+	f.Add("label", SandboxIDLabel+"="+sandboxID)
 	all, err := o.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: listing sandbox containers: %w", err)

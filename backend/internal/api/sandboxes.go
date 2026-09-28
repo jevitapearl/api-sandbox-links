@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -170,21 +171,48 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 
 // --- helpers -------------------------------------------------------------
 
-// requireOwnedSandbox resolves the {id} path param and verifies ownership,
-// writing an error response and returning ok=false when anything is off.
-func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*db.Sandbox, bool) {
+// errSandboxForbidden marks a failed sandbox access check. It is deliberately
+// uninformative: "not yours" and "does not exist" are the same answer, so the
+// API never confirms that someone else's sandbox ID is real.
+var errSandboxForbidden = errors.New("sandbox not accessible")
+
+// authorizeSandboxAccess resolves the {id} path param and confirms the
+// signed-in user owns it. Every per-sandbox route funnels through here.
+//
+// It deliberately does not touch the ResponseWriter. The live WebSocket
+// endpoints need to fail *after* the handshake with a close code, by which
+// point an HTTP status can no longer be sent; requireOwnedSandbox is the
+// writing wrapper used by the REST handlers.
+func (s *Server) authorizeSandboxAccess(r *http.Request) (*db.Sandbox, error) {
 	user, ok := s.userFrom(r)
 	if !ok {
-		writeErr(w, http.StatusUnauthorized, "not signed in")
-		return nil, false
+		return nil, errSandboxForbidden
 	}
 	id := chi.URLParam(r, "id")
 	owns, err := s.store.OwnsSandbox(id, user.ID)
-	if err != nil || !owns {
-		writeErr(w, http.StatusNotFound, "sandbox not found")
-		return nil, false
+	if err != nil {
+		s.logger.Warn("sandbox access check failed",
+			slog.String("sandbox", id), slog.String("err", err.Error()))
+		return nil, errSandboxForbidden
+	}
+	if !owns {
+		return nil, errSandboxForbidden
 	}
 	sb, err := s.store.GetSandbox(id)
+	if err != nil {
+		return nil, errSandboxForbidden
+	}
+	return sb, nil
+}
+
+// requireOwnedSandbox is the REST-shaped wrapper around
+// authorizeSandboxAccess: it writes the error response and reports ok=false.
+func (s *Server) requireOwnedSandbox(w http.ResponseWriter, r *http.Request) (*db.Sandbox, bool) {
+	if _, ok := s.userFrom(r); !ok {
+		writeErr(w, http.StatusUnauthorized, "not signed in")
+		return nil, false
+	}
+	sb, err := s.authorizeSandboxAccess(r)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "sandbox not found")
 		return nil, false
@@ -207,12 +235,15 @@ func (s *Server) sandboxJSON(sb *db.Sandbox) map[string]any {
 		"last_request_at":      sb.LastRequestAt,
 		"lifetime_seconds":     sb.LifetimeSeconds,
 		"expires_at":           sb.ExpiresAt,
-		"destroyed_at":         sb.DestroyedAt,
-		"destruction_reason":   sb.DestructionReason,
-		"detected_language":    sb.DetectedLanguage,
-		"build_config":         sb.BuildConfig,
-		"created_at":           sb.CreatedAt,
-		"updated_at":           sb.UpdatedAt,
+		// Null until the sandbox first goes live; the client uses it to show that
+		// the lifetime clock has not started yet.
+		"activated_at":       sb.ActivatedAt,
+		"destroyed_at":       sb.DestroyedAt,
+		"destruction_reason": sb.DestructionReason,
+		"detected_language":  sb.DetectedLanguage,
+		"build_config":       sb.BuildConfig,
+		"created_at":         sb.CreatedAt,
+		"updated_at":         sb.UpdatedAt,
 	}
 }
 

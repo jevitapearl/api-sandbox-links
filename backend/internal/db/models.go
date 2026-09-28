@@ -98,6 +98,10 @@ type Sandbox struct {
 
 	LifetimeSeconds   int64     `gorm:"not null;default:86400"`
 	ExpiresAt         time.Time `gorm:"not null"`
+	// ActivatedAt is when the sandbox first reached running, and is the instant
+	// the lifetime clock starts from. It stays nil until then, which is what
+	// tells a first activation apart from a redeploy.
+	ActivatedAt       *time.Time
 	DestroyedAt       *time.Time
 	DestructionReason string
 
@@ -165,8 +169,8 @@ type ResourceSnapshot struct {
 	CPUPercent       float32   `gorm:"not null" json:"cpu_percent"`
 	MemoryUsedBytes  int64     `gorm:"not null" json:"memory_used_bytes"`
 	MemoryLimitBytes int64     `gorm:"not null" json:"memory_limit_bytes"`
-	NetworkRXBytes   int64     `gorm:"not null" json:"network_rx_bytes"`
-	NetworkTXBytes   int64     `gorm:"not null" json:"network_tx_bytes"`
+	NetworkRxBytes   int64     `gorm:"not null" json:"network_rx_bytes"`
+	NetworkTxBytes   int64     `gorm:"not null" json:"network_tx_bytes"`
 	RecordedAt       time.Time `gorm:"not null;default:now()" json:"recorded_at"`
 }
 

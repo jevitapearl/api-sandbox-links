@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -160,14 +161,33 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		result.Port = discovered
 	}
 
-now := time.Now()
-	if err := d.store.UpdateSandbox(sandbox.ID, map[string]any{
+	now := time.Now()
+	// This is where the lifetime clock starts. On the first activation
+	// MarkSandboxActive rebases expires_at to now + lifetime_seconds, so the time
+	// spent building is not spent out of the user's sandbox. A redeploy returns
+	// false and leaves the deadline alone.
+	_, err = d.store.MarkSandboxActive(sandbox.ID, now, map[string]any{
 		"status":            string(db.StatusRunning),
 		"container_id":      result.ContainerID,
 		"image_tag":         imageTag,
 		"internal_port":     result.Port,
 		"detected_language": plan.DetectedLanguage,
-	}); err != nil {
+	})
+	switch {
+	case errors.Is(err, db.ErrSandboxDestroyed):
+		// The sandbox was destroyed or expired while it was building. The
+		// container that just came up belongs to a tombstone, so take it back
+		// down rather than reporting a successful deploy of something the user
+		// already deleted.
+		d.orch.logger.Warn("deploy: sandbox was destroyed while building; discarding the new container",
+			slog.String("sandbox", sandbox.ID), slog.String("container", result.ContainerID))
+		_ = d.orch.TeardownSandbox(ctx, sandbox)
+		return d.store.UpdateDeployment(deploy.ID, map[string]any{
+			"status":      string(db.DeployFailed),
+			"log_excerpt": "sandbox was destroyed while this deployment was still building",
+			"finished_at": now,
+		})
+	case err != nil:
 		return markFailed(fmt.Errorf("deploy: persisting run state: %w", err))
 	}
 	d.orch.EnsureStatsCollector(sandbox.ID, result.ContainerID)

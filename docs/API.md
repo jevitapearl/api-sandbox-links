@@ -1,26 +1,45 @@
-# API
+# API — `:8080` control plane
 
-Base URL: `http://localhost:8080`. All sandbox routes require the session cookie (`asl_session`) set by GitHub OAuth sign-in; in **dev auth mode** any request is auto-assigned the `devuser`.
+Base URL: `http://localhost:8080`. All routes except `/api/health` and the auth
+start/callback require the session cookie `asl_session` (set by GitHub OAuth).
+In **dev auth mode** (no `GITHUB_CLIENT_ID`) every `requireUser` request is
+auto-assigned the seeded `devuser`, so the whole surface is testable without
+logging in.
 
-Common conventions:
+Conventions:
 
-- JSON in/out; errors are `{ "error": "<message>" }` with an appropriate status code.
-- REST statuses: `200` OK, `201` created, `400` validation, `401`/`403` auth, `404` missing, `409` conflict (e.g. `git.ErrNoChanges`).
-- Sandbox lifecycle fields shared by every sandbox object:
+- JSON in/out. Errors are `{ "error": "<message>" }` with an appropriate status.
+- Statuses: `200` ok, `201` created, `202` accepted, `400` validation, `401`
+  auth, `404` missing, `409` conflict, `501`/`502` upstream.
+- The container's actual listening port is **discovered** at deploy time, so
+  `internal_port` may differ from the nixpacks-detected port (apps that hardcode
+  a port, e.g. Go apps on 8080). See ARCHITECTURE.md.
+
+## Sandbox object
+
+Every endpoint that returns a sandbox uses this shape (keys from `sandboxJSON`):
 
 ```jsonc
 {
   "id": "6a90fec3-8aad-4024-b83e-1cb76d867c9f",
   "subdomain": "node-js-sample-7e9fd5",
-  "repo_url": "https://github.com/heroku/node-js-sample",
-  "branch": "master",
-  "status": "running",               // queued|building|running|hibernated|failed|expired|deleted
-  "detected_language": "nodejs",
-  "container_id": "…",
   "url": "http://node-js-sample-7e9fd5.sandbox.localhost",
-  "created_at": "…", "expires_at": "…",
-  "lifetime_seconds": 86400, "idle_timeout_seconds": 900,
-  "parent_sandbox_id": null
+  "status": "running",                 // queued|building|running|hibernated|failed|expired|deleted
+  "branch": "master",
+  "parent_sandbox_id": null,           // set on forks
+  "container_id": "…",
+  "internal_port": 3000,
+  "idle_timeout_seconds": 900,
+  "last_request_at": "…",
+  "lifetime_seconds": 86400,
+  "activated_at": null,                 // set when the sandbox first goes live
+  "expires_at": "…",
+  "destroyed_at": null,                // tombstone when destroyed
+  "destruction_reason": null,          // lifetime_expired|user_requested
+  "detected_language": "nodejs",
+  "build_config": { "provider": "node", "port": 3000, "start": "…" },
+  "created_at": "…",
+  "updated_at": "…"
 }
 ```
 
@@ -28,68 +47,192 @@ Common conventions:
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/auth/github` | Redirect to GitHub OAuth (disabled → dev auto-login in dev mode). |
-| GET | `/api/auth/github/callback` | OAuth callback; sets `asl_session`, redirects to `/`. |
-| GET | `/api/me` | Current user `{ id, github_id, username, avatar_url, dev }`. |
-| POST | `/api/auth/logout` | Clears session. |
-| GET | `/api/health` | `{ status, time, dev_auth }` — no auth required. |
+| GET | `/api/auth/github` | Redirects to GitHub consent. `501` when OAuth is unconfigured (dev auth). |
+| GET | `/api/auth/github/callback` | Exchanges code, upserts user, sets `asl_session` (30d, httpOnly), redirects to `FRONTEND_URL/dashboard?authed=1`. |
+| GET | `/api/me` | `{ "github_id": 1, "username": "devuser", "avatar_url": "", "dev": true }`. |
+| POST | `/api/auth/logout` | Clears the cookie → `{ "ok": true }`. |
+| GET | `/api/health` | `{ "status": "ok", "time": "…", "dev_auth": true }` — no auth. |
 
 ## Sandboxes
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/sandboxes/` | List current user's sandboxes (array in `sandboxes`). |
-| POST | `/api/sandboxes/` | Create. Body: `{ repo_url, branch?, database?: "auto"\|"postgres"\|"mysql"\|"none", lifetime_seconds, idle_timeout_seconds, env_vars? }`. 201 with sandbox. |
-| GET | `/api/sandboxes/{id}` | Fetch one sandbox. |
-| POST | `/api/sandboxes/{id}/actions/extend` | Extend lifetime by ±24h (clamped to 7d max). Returns sandbox. |
-| POST | `/api/sandboxes/{id}/actions/destroy` | Teardown container/volume/network/deployments. Returns sandbox (status `deleted`). |
-| POST | `/api/sandboxes/{id}/fork` | Clone a running/hibernated sandbox into a sibling container with new owner. Returns the new sandbox. |
-| GET | `/api/sandboxes/{id}/deployments` | `{ deployments: [{ id, trigger, status, started_at, finished_at, log_excerpt }] }`. |
-| POST | `/api/sandboxes/{id}/deploy` | Trigger a redeploy from the current working tree (volume). `{ queued: true }`. |
-| GET | `/api/sandboxes/{id}/warnings` | `{ warnings: [{ stage, due_at, sent_at }] }`. |
-| GET | `/api/sandboxes/{id}/stats/history` | `{ snapshots: [{ recorded_at, cpu_pct, memory_used_bytes, memory_limit_bytes }] }` (last ~30m). |
+| GET | `/api/sandboxes/` | `{ "sandboxes": [<sandbox>, …] }`, newest first; tombstones included. |
+| POST | `/api/sandboxes/` | **Create.** Body below. `202` with the queued sandbox; deploys async. |
+| GET | `/api/sandboxes/{id}` | One sandbox. |
+| POST | `/api/sandboxes/{id}/actions/extend` | **Extend lifetime.** Body below. Returns `{ sandbox, extended_by, at_cap }`. |
+| POST | `/api/sandboxes/{id}/actions/destroy` | Permanent teardown → sandbox with `status: deleted`. |
+| POST | `/api/sandboxes/{id}/fork` | Clone into a sibling container under a new owner. Returns the new sandbox. |
+| GET | `/api/sandboxes/{id}/deployments` | `{ "deployments": [<deployment>, …] }`. |
+| POST | `/api/sandboxes/{id}/deploy` | Manual redeploy from the current working tree → `202 { "redeploying": true }`. |
+| GET | `/api/sandboxes/{id}/warnings` | Lifetime-warning state. Shape below. |
+| GET | `/api/sandboxes/{id}/stats/history?range=1h` | Persisted metrics for a historical range. Shape below. |
+| GET | `/api/sandboxes/{id}/logs/ws` | **Live logs** (WebSocket). See "WebSockets" below. |
+| GET | `/api/sandboxes/{id}/stats/ws` | **Live metrics** (WebSocket). See "WebSockets" below. |
 
-## File editor (Phase F)
+### Create — `POST /api/sandboxes/`
+
+```jsonc
+{
+  "repo_url": "https://github.com/heroku/node-js-sample",   // required, GitHub only
+  "branch": "master",                                        // optional, defaults to repo default
+  "lifetime_seconds": 86400,                                 // optional, default 86400; min 300, max 7d
+  "idle_timeout_seconds": 900,                               // optional, default 900; <60 → 900
+  "database": "auto",                                        // auto|postgres|mysql|none
+  "env_vars": { "KEY": "value" }                             // encrypted at rest, injected into container
+}
+```
+
+Validation: `repo_url` required and must parse as a GitHub repo; `database`
+`lifetime_seconds` is the total allowance; the countdown only starts once the
+sandbox reaches `running` (see `activated_at`), so build time is not billed
+against it.
+
+unknown value → 400; lifetime out of `[300, MAX_LIFETIME]` → 400 with the valid
+range in the message.
+
+### Extend — `POST /api/sandboxes/{id}/actions/extend`
+
+Body **requires** `additional_seconds` (positive integer):
+
+```jsonc
+{ "additional_seconds": 86400 }
+```
+
+`expires_at` is pushed forward but never past `created_at + MAX_LIFETIME`
+(default 7 days). Response:
+
+```jsonc
+{ "sandbox": { … }, "extended_by": 86400, "at_cap": false }
+```
+
+Destroyed sandboxes → 409. Missing/`<=0` body → 400.
+
+### Warnings — `GET /api/sandboxes/{id}/warnings`
+
+```jsonc
+{
+  "sandbox_id": "…",
+  "expires_at": "…",
+  "remaining_seconds": 84600,
+  "warnings": [
+    { "threshold": "24h", "title": "…", "message": "…" }
+  ]
+}
+```
+
+### Stats history — `GET /api/sandboxes/{id}/stats/history`
+
+`?range=` selects the window and is validated against a fixed allowlist — `1h`
+(default), `6h`, `24h`, `7d`. Anything else is `400`. Arbitrary durations are
+rejected rather than parsed because an unvalidated window becomes an unbounded
+scan of a table that only ever grows; each allowed window also carries its own
+row cap so a 7-day request does not try to draw 60k points.
+
+The cap takes the **newest** rows in the window and returns them oldest-first.
+A 24h window holds ~8,600 rows against a 1,000-row cap, so capping the oldest
+rows instead would render a stale two-hour slice from the start of the window
+and hide everything since.
+
+```jsonc
+{
+  "range": "1h",
+  "since": "2026-09-26T09:00:00Z",
+  "until": "2026-09-26T10:00:00Z",
+  "snapshots": [
+    { "id": 1, "sandbox_id": "…", "cpu_percent": 12.4, "memory_used_bytes": 8125000,
+      "memory_limit_bytes": 268435456, "network_rx_bytes": 102400,
+      "network_tx_bytes": 51200, "recorded_at": "…" }
+  ]
+}
+```
+
+Snapshots are recorded every 10 seconds while a sandbox runs and are pruned
+after 7 days, so a range wider than a sandbox's uptime simply returns fewer
+rows. The frontend shows "Not enough data yet" for a range with fewer than two
+rows rather than rendering an empty axis.
+
+## File editor
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/api/sandboxes/{id}/files` | Working-tree file tree (`.git` excluded). `{ files: [{ path, dir? }] }`. |
-| GET | `/api/sandboxes/{id}/file?path=<rel>` | File content. `{ path, content, binary, encoding }`. Paths are `safeJoin`-validated (traversal → 400). |
-| PUT | `/api/sandboxes/{id}/file` | Body `{ path, content, is_base64? }` → writes into the volume and **enqueues a save-redeploy** to the container. `{ saved: true, redeploying: true }`. |
+| GET | `/api/sandboxes/{id}/files` | Working-tree file tree (`.git` excluded). `{ "files": [ { "path": "…", "dir": false } ] }`. |
+| GET | `/api/sandboxes/{id}/file?path=<rel>` | `{ "path": "…", "content": "…", "binary": false, "encoding": "" }`. Paths are `safeJoin`-validated; traversal → 400, empty tree/volume → 404. |
+| PUT | `/api/sandboxes/{id}/file` | Body `{ "path": "…", "content": "…", "is_base64": false }`. Writes into the volume and **enqueues a save-redeploy**. `{ "saved": true, "redeploying": true }`. |
 
-## Commit & push (Phase G)
+## Commit & push
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/sandboxes/{id}/commit` | Body `{ message, branch?, direct_to_original?, force? }`. Commits the whole working tree and pushes. Default `branch` is `sandbox-edits-<subdomain>` (never touches your real branch); `direct_to_original + force` explicitly overrides. Returns `{ commit, branch, direct, pushed_at }`. `409` when nothing to commit. Requires a real GitHub token (OAuth). |
+| POST | `/api/sandboxes/{id}/commit` | Body `{ "message": "…", "branch": "…", "direct_to_original": false, "force": false }`. Commits the whole working tree and pushes. Default branch `sandbox-edits-<subdomain>` (never touches your real branch); `direct_to_original + force` explicitly overrides. Returns `{ "commit": "…", "branch": "…", "direct": false, "pushed_at": "…" }`. |
 
-## WebSockets (authed)
+Requires a real GitHub token (OAuth sign-in). `409` when there is nothing to
+commit (`git.ErrNoChanges`); `502` if the stored token doesn't authenticate.
 
-Both use **text frames** with JSON events.
+## WebSockets (authed, text frames with JSON)
 
-### Logs — `GET /api/sandboxes/{id}/logs`
+Both live sockets share one shape: a `type` discriminator plus that type's
+payload, where `type` is one of `log`, `stats`, `unavailable`, `closed`. The last
+two are how the server reports a stream it is deliberately *not* going to
+continue — a hibernated sandbox, a closed container — so the UI can show a real
+state instead of a panel that silently stops. Neither endpoint retries anything:
+reconnection with backoff is the client's job.
+
+**Authorization** is checked before the upgrade, and a failure is reported as
+WebSocket close code **1008 (policy violation)** rather than a refused
+handshake, so the client can distinguish "you may not watch this sandbox" from
+"the network is down" and stop retrying. The same check backs every REST
+route via `requireOwnedSandbox` → `authorizeSandboxAccess`
+(`api/sandboxes.go`); neither leaks whether someone else's sandbox ID is real.
+
+While a stream is open, each handler re-reads the sandbox row every 5s. If it
+has left `running` the server sends `closed` and shuts the stream down — Docker
+would otherwise keep streaming (or silently stall) against a stopped container.
+
+### Logs — `GET /api/sandboxes/{id}/logs/ws`
+
+Docker's multiplexed stdout/stderr frames are demuxed with
+`docker/pkg/stdcopy` and streamed line by line. The last **200** lines are
+replayed on connect, so a panel opened an hour into a container's life is not
+blank. `timestamp` is the container's own write time (Docker prefixes each line
+because the request sets `Timestamps: true`), which is what makes the replayed
+history honest.
 
 ```jsonc
-{ "kind": "log",  "stream": "stdout", "line": "listening on :3000" }
-{ "kind": "status", "status": "no-container" }     // sandbox has no running container
+{ "type": "log", "stream": "stdout", "timestamp": "2026-09-26T10:15:30.123Z", "line": "listening on :3000" }
+{ "type": "unavailable", "reason": "sandbox is hibernated — live output resumes when it wakes" }
+{ "type": "closed", "reason": "log stream ended" }
 ```
 
-Server demuxes docker's 8-byte header frames into lines (1 MiB guard), streams `Tail: 200` historical lines first, then follows live output. The client closes the connection to stop following.
+Only `running` sandboxes with a container produce `log` frames. A single line is
+capped at 1 MiB: anything longer arrives truncated and marked `…[line truncated]`
+rather than being dropped, because one oversized write (a minified bundle, a
+base64 blob) must not end the stream and take the rest of the container's output
+with it. A dropped client closes its Docker stream immediately, so repeatedly
+opening and closing the panel does not accumulate connections.
 
-### Stats — `GET /api/sandboxes/{id}/stats`
+### Stats — `GET /api/sandboxes/{id}/stats/ws`
+
+One flattened sample per frame, ~1/second from the collector, replayed from the
+last known sample every 2s so an idle container's chart still moves. Field names
+and meanings match the history rows above.
 
 ```jsonc
-{ "kind": "stats", "stats": { "recorded_at": "…", "cpu_pct": 12.4, "memory_used_bytes": 8125000, "memory_limit_bytes": 268435456 } }
+{ "type": "stats", "cpu_percent": 12.4, "memory_used_bytes": 83886080,
+  "memory_limit_bytes": 536870912, "network_rx_bytes": 102400,
+  "network_tx_bytes": 51200, "recorded_at": "2026-09-26T10:15:32Z" }
 ```
 
-Emitter restarts the container's metric loop every 30s and replays the current snapshot on (re)connect.
+All six fields are always present, zeros included — zero is the common value for
+an idle container, and a metric that vanishes when it reaches zero is a metric
+the chart cannot draw. `cpu_percent` is computed from counter deltas, not from
+Docker's raw totals — see ARCHITECTURE.md. `memory_used_bytes` has reclaimable
+page cache subtracted, and the network counters are summed across every
+interface. Both are per-sample deltas, not lifetime totals.
 
 ## Gateway (not REST)
 
-`:8090` is a reverse proxy, not part of this API surface. It also exposes `GET /` for health probes and a host-handling path that performs wake-on-request before forwarding `*.sandbox.localhost`.
-
-## Errors
-
-- Create: 400 when `repo_url` missing/unsupported protocol, lifetime < 300s or > 7d, unknown database.
-- Files: 400 on path traversal, 404 when the working tree/volume isn't materialized.
-- Commit: 404 sandbox/volume missing; 409 `ErrNoChanges`; 502 if the decrypted token doesn't authenticate with GitHub.
+`:8090` is a reverse proxy, not part of this API surface. It exposes `GET /` for
+health probes and a `*.sandbox.localhost` host path that resolves the sandbox by
+subdomain, wakes it if hibernating, then proxies to
+`<container-ip>:<internal_port>`. See ARCHITECTURE.md.

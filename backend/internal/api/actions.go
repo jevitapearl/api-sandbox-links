@@ -52,7 +52,14 @@ func (s *Server) handleExtendLifetime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	softCap := sb.CreatedAt.Add(time.Duration(s.maxLifetime()) * time.Second)
+	// The cap is "lifetime + extensions", measured from the same instant the
+	// lifetime is. Since that instant is now activation rather than creation, a
+	// slow build no longer eats into the user's extension allowance.
+	clockStart := sb.CreatedAt
+	if sb.ActivatedAt != nil {
+		clockStart = *sb.ActivatedAt
+	}
+	softCap := clockStart.Add(time.Duration(s.maxLifetime()) * time.Second)
 	newExpiry := sb.ExpiresAt.Add(time.Duration(req.AdditionalSeconds) * time.Second)
 	if newExpiry.After(softCap) {
 		newExpiry = softCap
@@ -158,19 +165,61 @@ func (s *Server) handleSandboxWarnings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStatsHistory serves persisted resource snapshots for the dashboard.
+// statsRange is one selectable window in the metrics history view. The row
+// limit is part of the definition, not a global constant: a 7d window at the
+// 10s flush cadence is ~60k rows, and the chart cannot draw that many points
+// anyway, so each window is capped at a density the chart stays readable at.
+type statsRange struct {
+	window time.Duration
+	limit  int
+}
+
+// statsRanges is the allowlist for GET /api/sandboxes/{id}/stats/history?range=.
+// Arbitrary durations are rejected rather than parsed: an unvalidated window
+// becomes an unbounded scan of a table that only ever grows, which is a cheap
+// way for one request to hurt every other sandbox.
+var statsRanges = map[string]statsRange{
+	"1h":  {window: time.Hour, limit: 360},
+	"6h":  {window: 6 * time.Hour, limit: 720},
+	"24h": {window: 24 * time.Hour, limit: 1000},
+	"7d":  {window: 7 * 24 * time.Hour, limit: 1400},
+}
+
+// defaultStatsRange is what an absent ?range= resolves to, matching the
+// dashboard's initial "last hour" selection.
+const defaultStatsRange = "1h"
+
+// handleStatsHistory serves persisted resource snapshots for the metrics
+// chart's non-live ranges. Unlike the WebSocket feed it is a plain REST call:
+// history is a fixed set of rows, so there is nothing to stream.
 func (s *Server) handleStatsHistory(w http.ResponseWriter, r *http.Request) {
 	sb, ok := s.requireOwnedSandbox(w, r)
 	if !ok {
 		return
 	}
-	since := time.Now().Add(-30 * time.Minute)
-	rows, err := s.store.QueryResourceSnapshots(sb.ID, since, time.Now(), 500)
+	name := r.URL.Query().Get("range")
+	if name == "" {
+		name = defaultStatsRange
+	}
+	span, ok := statsRanges[name]
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "range must be one of 1h, 6h, 24h, 7d")
+		return
+	}
+
+	now := time.Now()
+	rows, err := s.store.QueryResourceSnapshots(sb.ID, now.Add(-span.window), now, span.limit)
 	if err != nil {
+		s.logger.Warn("stats history query failed", slog.String("sandbox", sb.ID), slog.String("err", err.Error()))
 		writeErr(w, http.StatusInternalServerError, "could not query resource history")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"snapshots": rows})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"range":     name,
+		"since":     now.Add(-span.window),
+		"until":     now,
+		"snapshots": rows,
+	})
 }
 
 // destroyPermentally tears a sandbox down and records its tombstone. The typo
