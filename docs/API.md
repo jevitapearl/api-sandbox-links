@@ -1,10 +1,18 @@
 # API — `:8080` control plane
 
-Base URL: `http://localhost:8080`. All routes except `/api/health` and the auth
-start/callback require the session cookie `asl_session` (set by GitHub OAuth).
-In **dev auth mode** (no `GITHUB_CLIENT_ID`) every `requireUser` request is
-auto-assigned the seeded `devuser`, so the whole surface is testable without
-logging in.
+Base URL: `http://localhost:8080`. All routes except `/api/health`, the auth
+start/callback, and `POST /api/auth/logout` require the session cookie
+`asl_session` (set by GitHub OAuth). In **dev auth mode** (no
+`GITHUB_CLIENT_ID`) every `requireUser` request is auto-assigned the seeded
+`devuser`, so the whole surface is testable without logging in.
+
+`POST /api/auth/logout` is deliberately **not** behind `requireUser`: its whole
+job is to clear the session cookie, so requiring a valid session to reach it
+means a caller whose session has already gone bad cannot clear the very cookie
+that is causing it. It is idempotent and never touches the database, so it
+answers `200 { "ok": true }` whether the cookie was valid, stale, or absent.
+Clearing a cookie only affects the caller's own browser, so there is nothing to
+authorize.
 
 Conventions:
 
@@ -50,7 +58,7 @@ Every endpoint that returns a sandbox uses this shape (keys from `sandboxJSON`):
 | GET | `/api/auth/github` | Redirects to GitHub consent. `501` when OAuth is unconfigured (dev auth). |
 | GET | `/api/auth/github/callback` | Exchanges code, upserts user, sets `asl_session` (30d, httpOnly), redirects to `FRONTEND_URL/dashboard?authed=1`. |
 | GET | `/api/me` | `{ "github_id": 1, "username": "devuser", "avatar_url": "", "dev": true }`. |
-| POST | `/api/auth/logout` | Clears the cookie → `{ "ok": true }`. |
+| POST | `/api/auth/logout` | Clears the cookie → `{ "ok": true }`. **Public**, not behind `requireUser`; idempotent. |
 | GET | `/api/health` | `{ "status": "ok", "time": "…", "dev_auth": true }` — no auth. |
 
 ## Sandboxes
@@ -83,13 +91,13 @@ Every endpoint that returns a sandbox uses this shape (keys from `sandboxJSON`):
 }
 ```
 
-Validation: `repo_url` required and must parse as a GitHub repo; `database`
-`lifetime_seconds` is the total allowance; the countdown only starts once the
-sandbox reaches `running` (see `activated_at`), so build time is not billed
-against it.
+Validation: `repo_url` is required and must parse as a GitHub repo;
+`database` must be one of the four values above; `lifetime_seconds` is the total
+allowance, and the countdown only starts once the sandbox reaches `running` (see
+`activated_at`), so build time is not billed against it.
 
-unknown value → 400; lifetime out of `[300, MAX_LIFETIME]` → 400 with the valid
-range in the message.
+`database` unknown value → 400; lifetime out of `[300, MAX_LIFETIME]` → 400 with
+the valid range in the message.
 
 ### Extend — `POST /api/sandboxes/{id}/actions/extend`
 
@@ -99,8 +107,10 @@ Body **requires** `additional_seconds` (positive integer):
 { "additional_seconds": 86400 }
 ```
 
-`expires_at` is pushed forward but never past `created_at + MAX_LIFETIME`
-(default 7 days). Response:
+`expires_at` is pushed forward but never past `MAX_LIFETIME` (default 7 days)
+measured from the instant the lifetime clock started — `activated_at` where the
+sandbox has gone live, `created_at` otherwise. Anchoring on activation is what
+stops a slow build from eating into the extension allowance. Response:
 
 ```jsonc
 { "sandbox": { … }, "extended_by": 86400, "at_cap": false }
@@ -175,8 +185,8 @@ Both live sockets share one shape: a `type` discriminator plus that type's
 payload, where `type` is one of `log`, `stats`, `unavailable`, `closed`. The last
 two are how the server reports a stream it is deliberately *not* going to
 continue — a hibernated sandbox, a closed container — so the UI can show a real
-state instead of a panel that silently stops. Neither endpoint retries anything:
-reconnection with backoff is the client's job.
+state instead of a panel that silently stops. Neither endpoint retries anything: reconnection is the client's job, and the
+close code is how the two halves agree on what happened.
 
 **Authorization** is checked before the upgrade, and a failure is reported as
 WebSocket close code **1008 (policy violation)** rather than a refused
@@ -184,6 +194,53 @@ handshake, so the client can distinguish "you may not watch this sandbox" from
 "the network is down" and stop retrying. The same check backs every REST
 route via `requireOwnedSandbox` → `authorizeSandboxAccess`
 (`api/sandboxes.go`); neither leaks whether someone else's sandbox ID is real.
+
+### Close codes
+
+The codes are not interchangeable, and the difference is the whole diagnosis
+when a panel misbehaves:
+
+| Code | Meaning | Client behaviour |
+|---|---|---|
+| `1000` | Normal close, preceded by a `closed`/`unavailable` frame carrying the reason. | Stops; shows the reason. |
+| `1008` | Refused on policy grounds (not the owner). | Stops; shows "no access". |
+| `1006` | **Abnormal closure — no close frame was received.** | Retries with backoff. |
+| `1011` | Server ended the stream without delivering a terminal frame. | Retries with backoff. |
+
+`1006` is the ambiguous one, and it is ambiguous in a way that has cost real
+debugging time. A browser reports **all** of these as `1006`:
+
+- the TCP connection vanishing mid-stream;
+- a **failed handshake** — including a `401` from `requireUser`, a server that is
+  simply not running, and a `NEXT_PUBLIC_API_BASE` the browser treats as
+  cross-site so the session cookie is never attached to the upgrade.
+
+A browser also reports a refused handshake as `1006` even though the server sent
+a perfectly good `401`, because the handshake never completed. So `1006` alone
+cannot distinguish "the network dropped" from "the server refused" from "nothing
+is listening".
+
+The client resolves it with a second signal rather than the code. `openReconnectingSocket`
+(`frontend/src/lib/ws.ts`) tracks whether a socket ever fired `onopen`:
+
+- **closed without ever opening** → the handshake failed, not the network. If
+  `probeSession` (a `GET /api/me` call) then reports a bad session, the panel
+  stops immediately and says *"Your session has expired. Sign in again to watch
+  this sandbox live."* A session that checks out fine means the server is
+  unreachable, which **is** worth retrying, so the normal backoff applies. This
+  split is what stops an expired cookie from burning all five attempts in
+  silence.
+- **closed after opening** → a genuine drop; backoff as usual.
+
+Both panels print the code (`── connection lost (code 1006), retrying (1) ──`).
+Reconnection gives up after **5** attempts (1s, 2s, 4s, 8s, capped at 15s) and
+leaves a manual **Reconnect** button. The attempt counter deliberately survives
+a successful open: a server that accepts and then immediately drops the socket
+would otherwise reset the counter on every attempt and loop forever.
+
+> The log panel prints `── connected: streaming container logs ──` on a real
+> `onopen`, **not** on mount. It used to print on mount, which made a socket that
+> never opened indistinguishable from one that connected and then dropped.
 
 While a stream is open, each handler re-reads the sandbox row every 5s. If it
 has left `running` the server sends `closed` and shuts the stream down — Docker
@@ -210,6 +267,21 @@ rather than being dropped, because one oversized write (a minified bundle, a
 base64 blob) must not end the stream and take the rest of the container's output
 with it. A dropped client closes its Docker stream immediately, so repeatedly
 opening and closing the panel does not accumulate connections.
+
+The 200-line backfill applies to **stdout only**. Docker applies `--tail` to the
+*combined* log before filtering by fd, and orders that backfill stderr-first, so
+a tail smaller than the whole log discards all of stderr while trimming stdout
+normally. The stderr connection therefore uses `--tail all`; the reasoning and
+the measurements behind that are in ARCHITECTURE.md.
+
+If a client stops reading, the server's per-frame write eventually fails, the log
+pump returns, and the socket is closed. That used to be completely silent — no
+log line anywhere — so it was indistinguishable from a network drop. It is now a
+`warn` naming the sandbox, the fd, and the error:
+
+```
+logs: dropping client that stopped reading  sandbox=… stream=stdout err=…
+```
 
 ### Stats — `GET /api/sandboxes/{id}/stats/ws`
 

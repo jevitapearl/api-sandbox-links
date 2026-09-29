@@ -4,13 +4,15 @@ PostgreSQL via GORM, with a hand-written SQL migration as the source of truth:
 
 - **`backend/migrations/0001_init.up.sql`** — full schema. Applied on startup by
   `db.Migrate` (recorded in `schema_migrations`).
-- **`backend/migrations/0003_lifetime_starts_on_activation.up.sql`** — adds
-  `sandboxes.activated_at`, and moves the lifetime clock from `created_at` to the
-  first transition into `running`. See "When the lifetime starts" below.
 - **`backend/migrations/0002_snapshot_dedup.up.sql`** — adds the unique index on
   `resource_snapshots (sandbox_id, recorded_at)` that makes the live-metrics
   flush idempotent, deleting any duplicate rows the index would otherwise reject.
-  Never edit an already-applied migration; add a new one.
+- **`backend/migrations/0003_lifetime_starts_on_activation.up.sql`** — adds
+  `sandboxes.activated_at`, and moves the lifetime clock from `created_at` to the
+  first transition into `running`. See "When the lifetime starts" below.
+
+Each has a matching `.down.sql`. Never edit an already-applied migration; add a
+new one.
 - **`backend/internal/db/models.go`** — GORM models mapping back onto those
   tables. Schema changes always land as a new migration file first; keep the
   models in sync.
@@ -39,7 +41,7 @@ produces a runtime `relation "env_vars" does not exist` on the next save.
 |---|---|
 | `users` | `id uuid pk`, `github_id bigint unique`, `username`, `email`, `avatar_url`, `github_token bytea not null` (AES-GCM encrypted), `created_at`. |
 | `repositories` | per-user repo registry: `user_id` fk, `github_url`, `default_branch`, `created_at`, `unique(user_id, github_url)`. Created on first sandbox for that repo. |
-| `sandboxes` | `id`, `repository_id` fk, `parent_sandbox_id` (fork), `branch_name`, `subdomain unique`, `status`, `container_id`, `image_tag`, `internal_port`, `idle_timeout_seconds` (default 900), `last_request_at`, `lifetime_seconds` (default 86400), `expires_at`, `activated_at`, `destroyed_at`, `destruction_reason`, `detected_language`, `build_config jsonb`, `ai_suggested_env jsonb`, `created_at`, `updated_at`. Indexes on `status`, `parent_sandbox_id`, partial on `expires_at WHERE destroyed_at IS NULL`. |
+| `sandboxes` | `id`, `repository_id` fk, `parent_sandbox_id` (fork), `branch_name`, `subdomain unique`, `status`, `container_id`, `image_tag`, `internal_port`, `idle_timeout_seconds` (default 900), `last_request_at`, `lifetime_seconds` (default 86400), `expires_at`, `activated_at`, `destroyed_at`, `destruction_reason`, `detected_language`, `build_config jsonb`, `ai_suggested_env jsonb`, `created_at`, `updated_at`. Indexes on `status`, `parent_sandbox_id`, partial on `expires_at WHERE destroyed_at IS NULL`, and partial on `created_at WHERE activated_at IS NULL AND destroyed_at IS NULL` (the "still building" support query — the expiry reaper scans `expires_at`, not `activated_at`, so it needs no new index). |
 | `sandbox_env_vars` | `id`, `sandbox_id` fk, `key`, `value bytea` (encrypted), `is_ai_suggested`, `unique(sandbox_id, key)`. |
 | `sandbox_databases` | sidecar DBs: `sandbox_id` fk, `engine` (`postgres\|mysql\|sqlite`), `container_id`, `connection_url bytea` (encrypted), `forked_from`, `created_at`. One per sandbox; persisted across redeploys. |
 | `sandbox_lifetime_warnings` | dedup of sent warnings: `sandbox_id` fk, `threshold` (`24h\|1h\|5m` or proportional), `sent_at`, `unique(sandbox_id, threshold)`. |
@@ -50,6 +52,40 @@ produces a runtime `relation "env_vars" does not exist` on the next save.
 There are **no** `github_commits`, `sandbox_stats_rollups`, or
 `lifetime_warning_dismissals` tables despite earlier docs; those features are not
 in the current schema.
+
+## When the lifetime starts
+
+The lifetime is a promise about how long a *usable link* lives, so the clock must
+not run while the sandbox is still being built. `expires_at` was previously fixed
+at `created_at + lifetime_seconds`, which meant a 5-minute sandbox whose build
+took 3 minutes was destroyed 2 minutes after it came up — and a build longer than
+the entire lifetime was destroyed before it ever went live.
+
+`activated_at` records the moment the sandbox first reached `running`. The deploy
+path claims it with a conditional update, so exactly one transition wins:
+
+```sql
+UPDATE sandboxes
+   SET status = $2, activated_at = $3, expires_at = $3 + $4
+ WHERE id = $1 AND activated_at IS NULL
+```
+
+The `activated_at IS NULL` guard is what stops a redeploy — which also passes
+through `building → running` — from handing out a fresh full lifetime every time.
+Under concurrent claims exactly one row is updated; the rest see zero rows
+affected and fall through to the destroyed-row check.
+
+`expires_at` stays `NOT NULL` and is still set at creation. That provisional
+`created_at + lifetime` value remains the deadline for a sandbox that never
+activates, so a build that hangs or fails cannot leak a row forever. The
+trade-off is deliberate: if a build outlives the provisional deadline, the expiry
+reaper tombstones it before it ever activates. Extension caps are anchored on
+`activated_at` where present, so build time cannot eat into the extension
+allowance.
+
+A destroyed row is never resurrected. `MarkSandboxActive` returns
+`ErrSandboxDestroyed`, and the deploy path tears the freshly built container down
+and records the deployment as failed rather than reviving the sandbox.
 
 ## Session storage
 

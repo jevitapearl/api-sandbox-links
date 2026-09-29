@@ -4,7 +4,7 @@
 
 `api-sandbox-links/` contains two deployables plus local infra:
 
-- **`backend/`** — a Go 1.25 binary with **two listeners**:
+- **`backend/`** — a Go 1.26 binary with **two listeners**:
   - `:8080` — control plane: REST + WebSocket (chi router, see API.md).
   - `:8090` — gateway: reverse proxy with wake-on-request (see below).
 - **`frontend/`** — Next.js 16 (App Router, Tailwind v4) dashboard & sandbox console.
@@ -133,6 +133,13 @@ whenever a container has no TTY, and hand-parsing that framing is the usual
 source of garbled output). One pump goroutine per connection, each bound to the
 socket's context, so closing the panel closes both Docker streams. The backend
 never retries; the frontend reconnects with backoff, up to a manual button.
+
+Reconnection has two distinct stop conditions, and conflating them is what makes
+this channel look broken when it is not. A socket that **never opened** failed its
+handshake — a bad session, or a server that is not running — and a bad session is
+probed once and reported as *"sign in again"* rather than retried. A socket that
+opened and then dropped is a real network or server fault and gets the normal
+5-attempt backoff. See the close-code table in API.md.
 
 The two connections use different tails, which is deliberate. Docker applies
 `--tail` to the *combined* log before filtering by fd, and orders that backfill

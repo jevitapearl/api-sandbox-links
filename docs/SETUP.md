@@ -1,7 +1,12 @@
 # Setup (local dev)
 
-Verified environment: Linux, Go 1.25, Node 24, Docker 29 + Compose 2.x, nixpacks 1.x.
+Verified environment: Linux, Go 1.26, Node 24, Docker 29 + Compose 2.x, nixpacks 1.x.
 The steps below target this box but transfer to any Linux/macOS dev machine.
+
+`backend/go.mod` declares `go 1.26.0`, so a 1.25 toolchain still builds — Go's
+`GOTOOLCHAIN=auto` default fetches 1.26.0 on demand. The version that actually
+compiles the code is the one `go version` reports from `backend/`, not the one
+you started with.
 
 > There is **no Makefile** despite older references to `make bootstrap`/`make up` —
 > use the commands below directly. `go.mod` lives in `backend/`, so build from
@@ -70,22 +75,35 @@ go test -race ./...     # see the note below
 go build -o server ./cmd/server
 ```
 
-The tests need no backend process, but two suites reach for real infrastructure
+The tests need no backend process, but four suites reach for real infrastructure
 and skip themselves when it is absent:
 
-- `internal/orchestrator/logs_integration_test.go` drives a real **Docker**
-  daemon, starting throwaway containers to check the frame demux, the tail
-  backfill, and teardown. Honours `ASL_TEST_IMAGE` (default `node:20-alpine`) and
-  `DOCKER_HOST`. Point it at a small local image so it does not pull 800 MB.
-- `internal/db/queries_test.go` needs a real **Postgres**, because the migration,
-  the `ON CONFLICT` clause and the newest-N window are not things a unit test can
-  check. Set `ASL_TEST_DATABASE_URL`:
+- `internal/orchestrator/logs_integration_test.go` and
+  `internal/orchestrator/teardown_test.go` drive a real **Docker** daemon,
+  starting throwaway containers to check the frame demux, the per-fd tail
+  backfill, and teardown against a real Postgres. Honour `ASL_TEST_IMAGE`
+  (default `node:20-alpine`) and `DOCKER_HOST`. Point it at a small local image
+  so it does not pull 800 MB.
+- `internal/api/websocket_e2e_test.go` opens **real HTTP + WebSocket** connections
+  against the real chi router — including `requireUser` with a genuinely sealed
+  session cookie, because a refused handshake is the failure that a
+  context-injecting test double cannot see. It needs both Docker and Postgres.
+- `internal/db/queries_test.go` and `internal/db/activation_test.go` need a real
+  **Postgres**, because the migrations, the `ON CONFLICT` clause, the
+  newest-N window and the activation upsert are not things a unit test can check.
+  Set `ASL_TEST_DATABASE_URL`:
 
   ```bash
   docker run -d --rm -p 55432:5432 -e POSTGRES_PASSWORD=pw postgres:16-alpine
   ASL_TEST_DATABASE_URL='postgres://postgres:pw@localhost:55432/postgres?sslmode=disable' \
-    go test ./internal/db/
+    go test ./internal/db/ ./internal/api/ ./internal/orchestrator/
   ```
+
+  All three packages share that one database and `go test` runs them in
+  parallel, so each fixture uses a **disjoint** `github_id` range (`internal/db`
+  `1–4` and `101–105`, `internal/orchestrator` `201–204`, `internal/api`
+  `301–306`). Register a cleanup with `t.Cleanup` **before** the first insert —
+  a fatal between two inserts otherwise leaves rows that fail the next run.
 
 Then run from the **repo root** (godotenv loads `./.env` from the CWD — running
 from `backend/` makes config fail):
@@ -95,11 +113,24 @@ cd api-sandbox-links
 ./backend/server &              # :8080 API + :8090 gateway
 ```
 
-Health check:
+Health check — and run it before debugging anything in the UI:
 
 ```bash
 curl http://localhost:8080/api/health
 # {"status":"ok","time":"…","dev_auth":true}
+```
+
+A curl that prints nothing and exits non-zero (`curl -o /dev/null -w '%{http_code}'`
+prints `000`) means **nothing is listening**, which is a different problem from a
+bug. The log panel cannot tell you this: a WebSocket to a dead port is reported
+by the browser as close code **1006**, exactly as a dropped connection would be,
+so the panel will sit there retrying with no log lines while the API is simply
+not running. Check the process and the ports before reading any code:
+
+```bash
+ss -ltn | grep -E ':(8080|3000|8090)'   # both listeners + the frontend
+pgrep -af './backend/server'
+docker ps -a                            # exited containers are the usual culprit
 ```
 
 To stop the backend, `kill $(pgrep -f './backend/server')` (never `pkill -f
@@ -125,6 +156,8 @@ npm run dev      # http://localhost:3000
   DOM nor a running backend. A component test will need `environment: "jsdom"`
   plus `@vitejs/plugin-react` and `@testing-library/react`; see
   `frontend/node_modules/next/dist/docs/01-app/02-guides/testing/vitest.md`.
+- `npx tsc --noEmit` needs the generated `frontend/.next/types` to exist. If it
+  fails with missing Next route types, run `npm run build` once first.
 
 ## 6. GitHub OAuth (optional; skip to stay in dev auth)
 
@@ -172,3 +205,22 @@ npm run dev      # http://localhost:3000
   is disabled by design).
 - `/api/auth/github` returns 501 → OAuth config missing; either fill
   `GITHUB_CLIENT_ID`/`SECRET` or use dev auth mode.
+- **Log panel shows `connection lost (code 1006)` in a loop and never prints a
+  line** → work outward, in this order, because all three look identical from the
+  panel:
+  1. `curl -o /dev/null -w '%{http_code}' http://localhost:8080/api/health`. `000`
+     means nothing is listening — start the backend. This is the most common
+     cause and the least obvious, because the code is the same one a dropped
+     connection produces.
+  2. No error log from `logs: dropping client that stopped reading` on the server
+     means the server never objected, so the socket likely never opened.
+  3. The panel now probes `GET /api/me` when a handshake fails and says
+     *"Your session has expired"* if the cookie is bad. If it does not appear,
+     the cookie is fine and the handshake was refused for another reason —
+     check `NEXT_PUBLIC_API_BASE` resolves to a host the browser considers
+     same-site as the frontend, or the session cookie is not attached to the
+     upgrade at all.
+- **Log panel is blank but the app is obviously running** → the sandbox row must
+  be `running` with a container id; only then do `log` frames arrive. A
+  `hibernated` sandbox sends `unavailable` with a reason. Check with
+  `GET /api/sandboxes/{id}` before suspecting the socket.

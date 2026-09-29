@@ -8,7 +8,7 @@ sandbox. This is the index to all project docs.
 | [SETUP.md](SETUP.md) | Getting a dev environment running end-to-end: env vars, build order, ports, OAuth, troubleshooting. | `backend/internal/config/config.go`, `docker-compose.dev.yml`, `.env.example` |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Understanding the two-listener split, routing, wake-on-request, the build pipeline, sidecar databases, and reapers. | `backend/internal/orchestrator/`, `backend/internal/proxy/`, `traefik/dynamic.yml` |
 | [API.md](API.md) | Calling the REST/WebSocket surface: routes, request bodies, response shapes, errors. | `backend/internal/api/router.go` + handlers |
-| [DATABASE.md](DATABASE.md) | The Postgres schema, migrations, and the GORM models that map onto it. | `backend/migrations/0001_init.up.sql`, `backend/internal/db/models.go` |
+| [DATABASE.md](DATABASE.md) | The Postgres schema, migrations, the GORM models that map onto them, and when the lifetime clock starts. | `backend/migrations/`, `backend/internal/db/models.go`, `backend/internal/db/queries.go` |
 | [diagrams/sequence-live-stats.mmd](diagrams/sequence-live-stats.mmd) | Tracing one live metrics session: WS handshake, Docker stream, Redis newest-value key, 10s Postgres flush, 7d prune. | `backend/internal/api/websocket.go`, `backend/internal/orchestrator/stats.go` |
 
 ## How the docs stay honest
@@ -37,3 +37,10 @@ docs/
 The high-level flow: `Browser → :3000 (Next.js) → API :8080` for control plane
 (REST + WebSockets), and `Browser → :80 (Traefik) → gateway :8090 → sandbox
 container` for sandbox traffic. Details in ARCHITECTURE.md.
+
+Before debugging a UI symptom, check that the stack is actually up —
+`curl -o /dev/null -w '%{http_code}' http://localhost:8080/api/health` printing
+`000` means nothing is listening. A browser reports a WebSocket to a dead port
+as close code `1006`, which is the same code a dropped connection produces, so a
+stopped backend is easy to mistake for a bug in the socket handling. The
+troubleshooting section in SETUP.md works outward from that check.
