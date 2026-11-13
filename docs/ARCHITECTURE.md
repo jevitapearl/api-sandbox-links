@@ -64,21 +64,25 @@ service: host.docker.internal:8090   # the backend's gateway listener
    `gorm.io/driver/postgres`, `lib/pq`, `jackc/pgx`, `mysql2`,
    `go-sql-driver/mysql`). Sidecars persist across redeploys and are reused by
    container name `db_<sandbox-id[:8]>`.
-3. **Plan & build** — `nixpacks plan` → `nixpacks build --name sandbox-<subdomain>`.
-   `detectPort` reads `PORT`/`NIXPACKS_PORT` from the plan, else a provider
+3. **Plan & build** — pluggable `Builder` abstraction (`BUILDER=railpack|nixpacks`,
+   defaults to `railpack`). The orchestrator runs `Builder.PlanAnalyze` followed by
+   `Builder.BuildImage --name sandbox-<subdomain>`.
+   - **Default Builder (Railpack):** Builds against BuildKit via `BUILDKIT_HOST` (e.g. `tcp://127.0.0.1:1234`), providing layer caching and OCI artifact isolation.
+   - **Alternative Builder (Nixpacks):** Supported deprecated fallback engine (`BUILDER=nixpacks`), emitting structured deprecation warnings during deployment.
+   `detectPort` reads `PORT`, `RAILPACK_PORT`, or `NIXPACKS_PORT` from the plan, else a provider
    default (node 3000, python 8080, go 8080, ruby 4567, php/rust 8000, static 80,
    fallback 3000).
 4. **Run** — the app container starts on the private network `sandbox_<id[:8]>`
    with env: `PORT=<detected>`, the sandbox's decrypted env vars, and (when a
    sidecar exists) the expanded DB connection vars.
-5. **Port discovery** — the nixpacks-detected port can be wrong when an app
+5. **Port discovery** — the builder-detected port can be wrong when an app
    hardcodes its own listener (e.g. TaskForge binds `:8080` instead of honoring
    `PORT`). `DiscoverPort` probes the planned port plus
    `[8080, 8000, 3000, 5000, 5001, 4000, 9000, 8888, 80]` until one accepts TCP
    (up to 90s), and **overrides `internal_port`** with whatever actually binds.
    Deploy fails outright only if no candidate port answers.
 6. **Persist** — status `running`, `container_id`, `internal_port`,
-   `detected_language`, and a `build_config` JSON (`{provider, port, start}`).
+   `detected_language`, and a `build_config` JSON (`{builder, provider, port, start}`).
    A `deployments` row goes `building → success` with a `log_excerpt` tail.
 7. **Idle clock starts** — the gateway touches `lr:<id>` so a fresh sandbox gets
    its full idle grace period even with no traffic yet.
@@ -100,7 +104,7 @@ service: host.docker.internal:8090   # the backend's gateway listener
 
 | Property | Value |
 |---|---|
-| Image | `sandbox-<subdomain>:latest` (nixpacks output) |
+| Image | `sandbox-<subdomain>:latest` (builder output) |
 | Network | named bridge `sandbox_<id-first-8>` (created lazily by `ensureNetwork`) |
 | Volume | `sandbox_data_<id>` mounted at `/app` — persists across redeploys; holds the working tree the editor and git see |
 | Ports | none published — reachable only via the gateway over the private network |

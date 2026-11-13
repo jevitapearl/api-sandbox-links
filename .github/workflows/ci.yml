@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master", "production" ]
+  pull_request:
+    branches: [ "main", "master", "production" ]
+
+jobs:
+  lint-and-unit-tests:
+    name: Backend Unit Tests & Vetting
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit test suite
+        run: go test -v -count=1 ./...
+
+      - name: Verify server and CLI binaries build cleanly
+        run: |
+          go build -v -o /dev/null ./cmd/server
+          go build -v -o /dev/null ./cmd/rekey
+
+  e2e-smoke-test:
+    name: End-to-End Smoke Test (Docker & Gateway)
+    needs: lint-and-unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          check-latest: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Install Nixpacks CLI
+        run: |
+          curl -sSL https://nixpacks.com/install.sh | sudo bash
+          nixpacks --version
+
+      - name: Install Railpack CLI (Latest)
+        run: |
+          LATEST_TAG=$(curl -s https://api.github.com/repos/railwayapp/railpack/releases/latest | jq -r .tag_name)
+          if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
+            echo "Installing Railpack ${LATEST_TAG}..."
+            curl -fsSL "https://github.com/railwayapp/railpack/releases/download/${LATEST_TAG}/railpack-${LATEST_TAG}-x86_64-unknown-linux-musl.tar.gz" | sudo tar -xz -C /usr/local/bin railpack
+            railpack --version
+          else
+            echo "Could not resolve latest Railpack tag; skipping Railpack CLI install"
+          fi
+
+      - name: Configure Host for Rootless User Namespaces
+        run: |
+          # Ubuntu 24.04 (Noble Numbat) on GitHub-hosted runners restricts unprivileged
+          # user namespaces by default via AppArmor (kernel.apparmor_restrict_unprivileged_userns = 1).
+          # RootlessKit requires unprivileged user namespaces to start BuildKit without root privileges.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo "Current apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            echo "Updated apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)"
+          fi
+          if [ -f /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+
+      - name: Start Infrastructure Containers
+        run: |
+          dump_diagnostics() {
+            echo "::error::Infrastructure startup failed. Inspecting container states and logs..."
+            docker compose -f docker-compose.dev.yml ps -a || true
+            docker compose -f docker-compose.dev.yml logs --no-color buildkit || true
+            docker inspect sandbox-platform-buildkit || true
+          }
+          trap dump_diagnostics ERR
+
+          if ! docker compose -f docker-compose.dev.yml up -d --wait postgres redis buildkit; then
+            dump_diagnostics
+            exit 1
+          fi
+          docker compose -f docker-compose.dev.yml ps
+
+      - name: Run Nixpacks End-to-End Smoke Test
+        working-directory: backend
+        run: |
+          ASL_SMOKE_BUILDER=nixpacks go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
+
+      - name: Verify BuildKit Readiness & gRPC Diagnostics
+        run: |
+          echo "=== 1. Inspect Docker Compose Services ==="
+          docker compose -f docker-compose.dev.yml ps
+
+          echo "=== 2. Port Mapping Verification ==="
+          docker compose -f docker-compose.dev.yml port buildkit 1234
+
+          echo "=== 3. BuildKit Startup Logs ==="
+          docker compose -f docker-compose.dev.yml logs --tail 30 buildkit
+
+          echo "=== 4. Extract buildctl for Host-Side Probing ==="
+          sudo docker cp sandbox-platform-buildkit:/usr/bin/buildctl /usr/local/bin/buildctl
+          sudo chmod +x /usr/local/bin/buildctl
+          buildctl --version
+
+          echo "=== 5. Bounded BuildKit gRPC Readiness Loop ==="
+          TARGET_ADDR="tcp://127.0.0.1:1234"
+          MAX_RETRIES=30
+          READY=0
+          for i in $(seq 1 $MAX_RETRIES); do
+            if buildctl --addr "$TARGET_ADDR" debug workers >/tmp/buildkit-workers.log 2>&1; then
+              echo "BuildKit gRPC API responded successfully on attempt $i:"
+              cat /tmp/buildkit-workers.log
+              READY=1
+              break
+            fi
+            echo "Waiting for BuildKit gRPC API at $TARGET_ADDR (attempt $i/$MAX_RETRIES)..."
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::BuildKit gRPC API did not become ready at $TARGET_ADDR within ${MAX_RETRIES}s"
+            echo "=== BuildKit container logs ==="
+            docker compose -f docker-compose.dev.yml logs buildkit
+            echo "=== Container inspection ==="
+            docker inspect sandbox-platform-buildkit
+            exit 1
+          fi
+
+      - name: Run Railpack End-to-End Smoke Test (if CLI available)
+        working-directory: backend
+        run: |
+          if command -v railpack >/dev/null 2>&1; then
+            export BUILDKIT_HOST="tcp://127.0.0.1:1234"
+            echo "Running Railpack E2E smoke test against BUILDKIT_HOST=${BUILDKIT_HOST}..."
+            ASL_SMOKE_BUILDER=railpack go test -v -tags=smoke -run TestSmokeDeployNodeJSSample ./test/e2e/ -timeout 15m
+          else
+            echo "Railpack CLI not installed; skipping Railpack smoke test"
+          fi
+
+      - name: Run Maintenance Scripts Validation
+        run: |
+          ./scripts/cleanup_orphan_networks.sh
+          ./scripts/prune_disk.sh
+
+      - name: Teardown Infrastructure
+        if: always()
+        run: |
+          docker compose -f docker-compose.dev.yml down -v

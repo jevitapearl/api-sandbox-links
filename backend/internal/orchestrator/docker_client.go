@@ -13,6 +13,8 @@ import (
 	"github.com/api-sandbox-links/backend/internal/cache"
 	"github.com/api-sandbox-links/backend/internal/config"
 	"github.com/api-sandbox-links/backend/internal/db"
+	"github.com/api-sandbox-links/backend/internal/runtime"
+	"github.com/api-sandbox-links/backend/internal/runtime/docker"
 	"github.com/api-sandbox-links/backend/internal/secret"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -29,11 +31,13 @@ import (
 type Orchestrator struct {
 	ctx        context.Context
 	docker     *client.Client
+	runner     runtime.ContainerRunner
 	cfg        *config.Config
 	store      *db.Store
 	cache      *cache.Redis
 	secret     *secret.Box
 	logger     *slog.Logger
+	builder    Builder
 	statsMu    sync.Mutex // guards collectors
 	collectors map[string]*StatsCollector
 }
@@ -52,14 +56,20 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 	if _, err := cli.Ping(ctx); err != nil {
 		return nil, fmt.Errorf("orchestrator: cannot reach docker daemon (%s): %w", cfg.DockerHost, err)
 	}
+	builder, err := NewBuilder(cfg, logger)
+	if err != nil {
+		return nil, fmt.Errorf("orchestrator: initializing builder: %w", err)
+	}
 	return &Orchestrator{
 		ctx:        ctx,
 		docker:     cli,
+		runner:     docker.NewDockerRunner(cli),
 		cfg:        cfg,
 		store:      store,
 		cache:      cache,
 		secret:     box,
 		logger:     logger,
+		builder:    builder,
 		collectors: map[string]*StatsCollector{},
 	}, nil
 }
@@ -67,6 +77,38 @@ func New(ctx context.Context, cfg *config.Config, store *db.Store, cache *cache.
 // Close releases the orchestrator's Docker client connection.
 func (o *Orchestrator) Close() error {
 	return o.docker.Close()
+}
+
+// Ping verifies connectivity to the Docker daemon.
+func (o *Orchestrator) Ping(ctx context.Context) error {
+	if o == nil || o.docker == nil {
+		return fmt.Errorf("orchestrator: docker client not initialized")
+	}
+	_, err := o.docker.Ping(ctx)
+	return err
+}
+
+// Runner returns the active container runner abstraction.
+func (o *Orchestrator) Runner() runtime.ContainerRunner {
+	return o.runner
+}
+
+// SetRunner overrides the container runner (useful for testing or alternative runtime backends).
+func (o *Orchestrator) SetRunner(r runtime.ContainerRunner) {
+	o.runner = r
+}
+
+// ImageSizeBytes inspects the given image tag and returns its virtual size in bytes.
+// If the image does not exist or inspection fails, an error is returned.
+func (o *Orchestrator) ImageSizeBytes(ctx context.Context, imageTag string) (int64, error) {
+	if o == nil || o.docker == nil {
+		return 0, fmt.Errorf("orchestrator: docker client not initialized")
+	}
+	inspect, _, err := o.docker.ImageInspectWithRaw(ctx, imageTag)
+	if err != nil {
+		return 0, fmt.Errorf("orchestrator: inspecting image %s: %w", imageTag, err)
+	}
+	return inspect.Size, nil
 }
 
 // Logger exposes the slog logger for use by helpers in this package.
