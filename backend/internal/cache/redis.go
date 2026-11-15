@@ -36,6 +36,14 @@ func New(ctx context.Context, url string) (*Redis, error) {
 	return &Redis{client: client}, nil
 }
 
+// Ping verifies connectivity to Redis.
+func (r *Redis) Ping(ctx context.Context) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("cache: redis client not initialized")
+	}
+	return r.client.Ping(ctx).Err()
+}
+
 // ---- last-request-at markers (idle timeout) -----------------------------
 //
 // Each request through the sandbox gateway calls Touch on the sandbox's key
@@ -173,9 +181,4 @@ func DecodeStatFrame(raw []byte) (*StatFrame, error) {
 		return nil, fmt.Errorf("cache: decoding published stat sample: %w", err)
 	}
 	return &f, nil
-}
-
-// Ping verifies Redis is reachable; used by readiness and the doctor.
-func (r *Redis) Ping(ctx context.Context) error {
-	return r.client.Ping(ctx).Err()
 }

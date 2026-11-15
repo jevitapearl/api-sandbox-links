@@ -71,6 +71,24 @@ func (d *Deployer) acquireBuildSlot(ctx context.Context) (func(), error) {
 	}
 }
 
+// RecoverStuckBuilds sweeps any deployments left in pending or building state
+// from a previous process run, and marks them failed with an explanatory message.
+func (d *Deployer) RecoverStuckBuilds(ctx context.Context) (int64, error) {
+	if d == nil || d.store == nil {
+		return 0, nil
+	}
+	return d.store.RecoverStuckDeployments(0, "build aborted: worker process restarted while build was in progress")
+}
+
+// SweepTimedOutBuilds marks any builds that have been running longer than DeployTimeout
+// as failed, preventing stuck processes or wedged tools from holding up queue slots forever.
+func (d *Deployer) SweepTimedOutBuilds(ctx context.Context) (int64, error) {
+	if d == nil || d.store == nil {
+		return 0, nil
+	}
+	return d.store.RecoverStuckDeployments(DeployTimeout, "build aborted: build exceeded maximum execution timeout of 20 minutes")
+}
+
 // sandboxDir returns the on-disk clone directory for a sandbox.
 func (d *Deployer) sandboxDir(subdomain string) string {
 	return filepath.Join(d.cfg.SandboxWorkDir, subdomain)
@@ -156,9 +174,10 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 			d.orch.logger.Info("deploy: failed build on destroyed sandbox; removed work dir",
 				slog.String("sandbox", sandbox.ID))
 		}
-		return d.store.UpdateSandbox(sandbox.ID, map[string]any{
+		_ = d.store.UpdateSandbox(sandbox.ID, map[string]any{
 			"status": string(db.StatusFailed),
 		})
+		return cause
 	}
 
 	// Queue behind other builds before doing any expensive work. The row is
@@ -228,13 +247,7 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 	if startCommand == "" {
 		startCommand = strings.TrimSpace(plan.StartCmd)
 	}
-	project := analyze.DetectProject(workDir)
-	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog, BuildOptions{
-		StartCommand:    startCommand,
-		Language:        project.Language,
-		Framework:       project.Framework,
-		LanguageVersion: project.Version,
-	})
+	imageTag, err := d.orch.BuildImage(ctx, workDir, "sandbox-"+sandbox.Subdomain, buildLog)
 	if err != nil {
 		// Push build log lines to Redis on failure
 		_ = d.cache.AppendBuildLogBatch(ctx, sandbox.ID, buildLog.String())
@@ -338,7 +351,12 @@ func (d *Deployer) DeploySandbox(ctx context.Context, sandbox *db.Sandbox, opts 
 		d.orch.logger.Warn("deploy: finalizing deployment record", slog.String("err", err.Error()))
 	}
 	// Capture build metadata on the sandbox row for the UI/debugging.
+	builderName := plan.Builder
+	if builderName == "" && d.orch != nil && d.orch.Builder() != nil {
+		builderName = d.orch.Builder().Name()
+	}
 	buildMeta, _ := json.Marshal(map[string]any{
+		"builder":  builderName,
 		"provider": plan.Provider,
 		"port":     plan.InternalPort,
 		"start":    startCommand,
